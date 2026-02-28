@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+.env
+config.json
+prompt_history.json
+*.egg-info/
+.eggs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Large binaries (download separately - see README)
+stockfish.exe
+chess_model.pt
+
+# OS
+.DS_Store
+Thumbs.db
