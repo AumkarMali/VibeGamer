@@ -2088,10 +2088,10 @@ def _open_task_window(parent):
 def _run_tkinter_floating_dot():
     """Apple Intelligence-style floating glass dot. See-through, expands to 5 glass dots."""
     TRANS = "#010101"
-    DOT_SIZE = 120
-    EXPANDED_SIZE = 480
-    RGB_THICKNESS = 3
-    RGB_SPEED_MS = 30
+    DOT_SIZE = 160
+    EXPANDED_SIZE = 500
+    RGB_THICKNESS = 6
+    RGB_SPEED_MS = 50
 
     root = tk.Tk()
     root.title("")
@@ -2126,9 +2126,10 @@ def _run_tkinter_floating_dot():
     rgb_win.configure(bg=rgb_trans)
     try:
         rgb_win.attributes("-transparentcolor", rgb_trans)
+        rgb_win.attributes("-alpha", 0.4)
     except tk.TclError:
         try:
-            rgb_win.attributes("-alpha", 0.85)
+            rgb_win.attributes("-alpha", 0.4)
         except tk.TclError:
             pass
     rgb_cv = tk.Canvas(rgb_win, bg=rgb_trans, highlightthickness=0, bd=0,
@@ -2140,58 +2141,86 @@ def _run_tkinter_floating_dot():
 
     rgb_hue = [0.0]
     rgb_active = [False]
-    rgb_fading = [None]        # "in" | "out" | None
-    rgb_opacity = [0.0]        # 0.0 to 1.0 (controls brightness during fade)
+    rgb_fading = [None]
+    rgb_opacity = [0.0]
     rgb_job = [None]
-    RGB_FADE_STEP = 0.045      # opacity change per tick (~22 ticks = ~0.7s fade)
-    RGB_GLOW_LAYERS = 4        # layered lines for soft glow edge
+    rgb_photo = [None]
+    RGB_FADE_STEP = 0.12
+    RGB_GLOW_DEPTH = 50
 
-    def _hsv_to_hex(h, s=1.0, v=1.0):
-        r, g, b = colorsys.hsv_to_rgb(h % 1.0, s, v)
-        return f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
+    NEON_COLORS = [
+        (255, 0, 102),    # hot pink
+        (0, 255, 255),    # cyan
+        (57, 255, 20),    # neon green
+        (255, 0, 255),    # magenta
+        (0, 191, 255),    # deep sky blue
+        (255, 255, 0),    # yellow
+        (255, 105, 180),  # pink
+        (0, 255, 128),    # spring green
+    ]
 
-    def _blend(hex_color, opacity):
-        """Dim a hex color toward black by opacity (0=invisible, 1=full)."""
-        r = int(hex_color[1:3], 16)
-        g = int(hex_color[3:5], 16)
-        b = int(hex_color[5:7], 16)
-        r = int(r * opacity)
-        g = int(g * opacity)
-        b = int(b * opacity)
-        return f"#{max(r,3):02x}{max(g,3):02x}{max(b,3):02x}"
+    RGB_RENDER_SCALE = 2
+    rw, rh = sw // RGB_RENDER_SCALE, sh // RGB_RENDER_SCALE
+
+    _yy, _xx = np.mgrid[0:rh, 0:rw]
+    _dt = _yy.astype(np.float32)
+    _db = (rh - 1 - _yy).astype(np.float32)
+    _dl = _xx.astype(np.float32)
+    _dr = (rw - 1 - _xx).astype(np.float32)
+    _dist = np.minimum(np.minimum(_dt, _db), np.minimum(_dl, _dr))
+    _glow_d = RGB_GLOW_DEPTH / RGB_RENDER_SCALE
+    _mask = _dist < _glow_d
+    _fade_raw = np.where(_mask, ((_glow_d - _dist) / _glow_d) ** 2.0, 0.0).astype(np.float32)
+    _is_top = (_dt <= _db) & (_dt <= _dl) & (_dt <= _dr)
+    _is_bot = (~_is_top) & (_db <= _dl) & (_db <= _dr)
+    _is_left = (~_is_top) & (~_is_bot) & (_dl <= _dr)
+    _pos_base = np.zeros((rh, rw), dtype=np.float32)
+    _pos_base[_is_top] = (_xx[_is_top] / rw)
+    _pos_base[_is_bot] = (0.5 + _xx[_is_bot] / rw)
+    _pos_base[_is_left] = (0.75 + _yy[_is_left] / rh)
+    _is_right = ~(_is_top | _is_bot | _is_left)
+    _pos_base[_is_right] = (0.25 + _yy[_is_right] / rh)
+
+    _NEON_LUT = np.zeros((256, 3), dtype=np.float32)
+    n_colors = len(NEON_COLORS)
+    for i in range(256):
+        t_val = i / 256.0 * n_colors
+        i0 = int(t_val) % n_colors
+        i1 = (i0 + 1) % n_colors
+        f = t_val - int(t_val)
+        for ch in range(3):
+            _NEON_LUT[i, ch] = NEON_COLORS[i0][ch] + (NEON_COLORS[i1][ch] - NEON_COLORS[i0][ch]) * f
+
+    _bg_arr = np.full((rh, rw, 3), 2, dtype=np.float32)
+    _fade3 = _fade_raw[:, :, np.newaxis]
+
+    def _build_rgb_array(hue_offset, opacity):
+        """Render neon border with numpy -- returns uint8 array at half-res."""
+        fade3 = _fade3 * opacity
+        pos = (_pos_base + hue_offset) % 1.0
+        lut_idx = np.clip((pos * 255).astype(np.int32), 0, 255)
+        neon = _NEON_LUT[lut_idx]
+        out = neon * fade3 + _bg_arr * (1.0 - fade3)
+        result = np.clip(out, 3, 255).astype(np.uint8)
+        result[~_mask] = 2
+        return result
+
+    rgb_img_id = [None]
 
     def _draw_rgb_border():
-        rgb_cv.delete("all")
         op = rgb_opacity[0]
         if op <= 0.01:
+            if rgb_img_id[0]:
+                rgb_cv.delete(rgb_img_id[0])
+                rgb_img_id[0] = None
             return
-        base_t = RGB_THICKNESS
-        segments = 80
-        seg_w = sw / segments
-        seg_h = sh / segments
-
-        for layer in range(RGB_GLOW_LAYERS, 0, -1):
-            t = base_t + (layer - 1) * 2
-            layer_op = op * (0.3 if layer > 1 else 1.0) * (1.0 / layer)
-            offset_y = (layer - 1) * 2
-
-            for i in range(segments):
-                hue_top = (rgb_hue[0] + i / segments) % 1.0
-                hue_bot = (rgb_hue[0] + 0.5 + i / segments) % 1.0
-                c_top = _blend(_hsv_to_hex(hue_top, 0.85, 1.0), layer_op)
-                c_bot = _blend(_hsv_to_hex(hue_bot, 0.85, 1.0), layer_op)
-                x1, x2 = int(i * seg_w), int((i + 1) * seg_w)
-                rgb_cv.create_rectangle(x1, offset_y, x2, offset_y + t, fill=c_top, outline="")
-                rgb_cv.create_rectangle(x1, sh - offset_y - t, x2, sh - offset_y, fill=c_bot, outline="")
-
-            for i in range(segments):
-                hue_left = (rgb_hue[0] + 0.75 + i / segments) % 1.0
-                hue_right = (rgb_hue[0] + 0.25 + i / segments) % 1.0
-                c_left = _blend(_hsv_to_hex(hue_left, 0.85, 1.0), layer_op)
-                c_right = _blend(_hsv_to_hex(hue_right, 0.85, 1.0), layer_op)
-                y1, y2 = int(i * seg_h), int((i + 1) * seg_h)
-                rgb_cv.create_rectangle(offset_y, y1, offset_y + t, y2, fill=c_left, outline="")
-                rgb_cv.create_rectangle(sw - offset_y - t, y1, sw - offset_y, y2, fill=c_right, outline="")
+        arr = _build_rgb_array(rgb_hue[0], op)
+        img = Image.fromarray(arr, "RGB").resize((sw, sh), Image.NEAREST)
+        rgb_photo[0] = ImageTk.PhotoImage(img)
+        if rgb_img_id[0]:
+            rgb_cv.itemconfigure(rgb_img_id[0], image=rgb_photo[0])
+        else:
+            rgb_img_id[0] = rgb_cv.create_image(0, 0, anchor="nw", image=rgb_photo[0])
 
     def _rgb_tick():
         if not rgb_active[0] and rgb_fading[0] != "out":
@@ -2206,11 +2235,13 @@ def _run_tkinter_floating_dot():
             rgb_opacity[0] = max(0.0, rgb_opacity[0] - RGB_FADE_STEP)
             if rgb_opacity[0] <= 0.0:
                 rgb_fading[0] = None
-                rgb_cv.delete("all")
+                if rgb_img_id[0]:
+                    rgb_cv.delete(rgb_img_id[0])
+                    rgb_img_id[0] = None
                 rgb_win.withdraw()
                 return
 
-        rgb_hue[0] = (rgb_hue[0] + 0.005) % 1.0
+        rgb_hue[0] = (rgb_hue[0] + 0.012) % 1.0
         _draw_rgb_border()
         rgb_job[0] = root.after(RGB_SPEED_MS, _rgb_tick)
 
@@ -2239,25 +2270,25 @@ def _run_tkinter_floating_dot():
     canvas.pack(fill=tk.BOTH, expand=True)
     canvas.config(cursor="hand2")
 
-    # ── Drag support ──
-    drag = {"x": 0, "y": 0, "dragging": False}
+    # ── Drag support (screen-coords based, no winfo during drag) ──
+    drag = {"sx": 0, "sy": 0, "wx": 0, "wy": 0, "dragging": False}
 
     def _drag_start(e):
-        drag["x"] = e.x
-        drag["y"] = e.y
+        drag["sx"] = e.x_root
+        drag["sy"] = e.y_root
+        drag["wx"] = root.winfo_x()
+        drag["wy"] = root.winfo_y()
         drag["dragging"] = False
 
     def _drag_motion(e):
-        dx = abs(e.x - drag["x"])
-        dy = abs(e.y - drag["y"])
-        if dx > 4 or dy > 4:
+        dx = abs(e.x_root - drag["sx"])
+        dy = abs(e.y_root - drag["sy"])
+        if dx > 8 or dy > 8:
             drag["dragging"] = True
         if drag["dragging"]:
-            nx = root.winfo_x() + (e.x - drag["x"])
-            ny = root.winfo_y() + (e.y - drag["y"])
+            nx = drag["wx"] + (e.x_root - drag["sx"])
+            ny = drag["wy"] + (e.y_root - drag["sy"])
             root.geometry(f"+{nx}+{ny}")
-            drag["x"] = e.x
-            drag["y"] = e.y
 
     canvas.bind("<Button-1>", _drag_start)
     canvas.bind("<B1-Motion>", _drag_motion)
@@ -2270,13 +2301,7 @@ def _run_tkinter_floating_dot():
         else:
             root.geometry(f"{size}x{size}")
 
-    def _anim_tick():
-        anim_phase[0] = (anim_phase[0] + 0.018) % 1.0
-        redraw()
-        try:
-            dot_anim_job[0] = root.after(ANIM_MS, _anim_tick)
-        except tk.TclError:
-            pass
+    # No animation tick for dots -- they're pre-rendered and static
 
     def _cleanup_and_quit(e=None):
         rgb_active[0] = False
@@ -2284,60 +2309,67 @@ def _run_tkinter_floating_dot():
         if rgb_job[0]:
             root.after_cancel(rgb_job[0])
             rgb_job[0] = None
-        if dot_anim_job[0]:
-            try:
-                root.after_cancel(dot_anim_job[0])
-            except tk.TclError:
-                pass
-            dot_anim_job[0] = None
         root.destroy()
 
-    anim_phase = [0.0]
-    dot_anim_job = [None]
-    ANIM_MS = 42
+    dot_photos = {}
+    DOT_SS = 2
 
-    def _lerp_hex(c1, c2, t):
-        """Blend two hex colors; t in [0,1]."""
-        r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
-        r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
-        r = int(r1 + (r2 - r1) * t)
-        g = int(g1 + (g2 - g1) * t)
-        b = int(b1 + (b2 - b1) * t)
-        return f"#{max(0,min(255,r)):02x}{max(0,min(255,g)):02x}{max(0,min(255,b)):02x}"
+    def _render_dot_image(r, bright):
+        """Render a smooth anti-aliased glass dot using PIL. Called once at startup."""
+        trans = (1, 1, 1)
+        ss = DOT_SS
+        sz = int(r * 2 + 20)
+        big = sz * ss
+        img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        c = big // 2
 
-    def _draw_glass_circle(cx, cy, r, tag, bright=False, phase=0.0):
-        """Translucent glass dot -- concentric rings, slightly thicker; breathes with phase."""
-        # Breathing scale: bigger then smaller (phase 0→1 = one full cycle)
-        breath = 1.0 + 0.08 * math.sin(phase * 2 * math.pi)
-        r0 = r * breath
-        r1 = (r - 3) * breath
-        r2 = (r - 6) * breath
-        r3 = (r - 9) * breath
-        ir = max((r - 13) * breath, 3)
+        ring_defs = [
+            (0, 4, (16, 16, 24), 255),
+            (4, 4, (106, 176, 230) if bright else (72, 136, 184), 255),
+            (9, 3, (224, 232, 240) if bright else (176, 184, 196), 240),
+            (13, 2, (26, 26, 40), 180),
+            (16, 3, (112, 168, 216) if bright else (80, 144, 192), 220),
+            (20, 2, (240, 244, 255) if bright else (224, 232, 240), 200),
+        ]
 
-        # Color integration: blend toward white at peak (phase 0.5)
-        t = 0.3 + 0.4 * math.sin(phase * 2 * math.pi)  # 0.3 to 0.7
-        blue_outer = _lerp_hex("#4888b8", "#a0c8f0", t) if not bright else _lerp_hex("#6ab0e6", "#c8e0ff", t)
-        white_ring = _lerp_hex("#b0b8c4", "#f0f4ff", t) if not bright else _lerp_hex("#e0e8f0", "#ffffff", t)
-        blue_inner = _lerp_hex("#385878", "#6090b8", t) if not bright else _lerp_hex("#5090c0", "#80b8e8", t)
+        for inset, w, color_rgb, alpha in ring_defs:
+            ri = max(int((r - inset) * ss), 2)
+            draw.ellipse([c - ri, c - ri, c + ri, c + ri],
+                        fill=None, outline=color_rgb + (alpha,), width=w * ss)
 
-        # Outermost -- black ring (thicker)
-        canvas.create_oval(cx - r0, cy - r0, cx + r0, cy + r0, fill="", outline="#1a1a1a", width=3, tags=(tag,))
-        # Light blue glow ring (thicker)
-        canvas.create_oval(cx - r1, cy - r1, cx + r1, cy + r1, fill="", outline=blue_outer, width=3, tags=(tag,))
-        # White ring (thicker)
-        canvas.create_oval(cx - r2, cy - r2, cx + r2, cy + r2, fill="", outline=white_ring, width=2, tags=(tag,))
-        # Inner black ring (thicker)
-        canvas.create_oval(cx - r3, cy - r3, cx + r3, cy + r3, fill="", outline="#2a2a2a" if not bright else "#3a3a3a", width=2, tags=(tag,))
-        # Center fill (visible, clickable) + innermost ring
-        canvas.create_oval(cx - ir, cy - ir, cx + ir, cy + ir, fill="#c8d4e4" if bright else "#586880", outline=blue_inner, width=2, dash=(2, 3), tags=(tag,))
+        ci = max(int((r - 24) * ss), 3)
+        fc = (208, 220, 232, 220) if bright else (80, 104, 120, 220)
+        oc = (112, 168, 216, 180) if bright else (56, 80, 104, 180)
+        draw.ellipse([c - ci, c - ci, c + ci, c + ci], fill=fc, outline=oc, width=2 * ss)
+
+        small = img.resize((sz, sz), Image.LANCZOS)
+        bg = Image.new("RGB", (sz, sz), trans)
+        bg.paste(small, mask=small.split()[3])
+        return bg
+
+    def _prerender_dots():
+        """Pre-render all dot sizes at startup. Returns dict of tag -> PhotoImage."""
+        for tag, r, bright in [("hub_main", 52, True), ("sub_dim", 78, False)]:
+            img = _render_dot_image(r, bright)
+            dot_photos[tag] = ImageTk.PhotoImage(img)
+            dot_photos[f"{tag}_sz"] = img.width
+
+    _prerender_dots()
+
+    def _draw_glass_circle(cx, cy, r, tag, bright=False):
+        """Place a pre-rendered dot image on the canvas (instant)."""
+        key = "hub_main" if bright else "sub_dim"
+        photo = dot_photos[key]
+        sz = dot_photos[f"{key}_sz"]
+        canvas.create_image(cx - sz // 2, cy - sz // 2, anchor="nw", image=photo, tags=(tag,))
 
     def redraw():
         canvas.delete("all")
         exp = expanded[0]
         size = EXPANDED_SIZE if exp else DOT_SIZE
         cx, cy = size // 2, size // 2
-        orb_r = 38
+        orb_r = 52
 
         def _click_if_not_drag(callback):
             """Only fire callback if the user clicked, not dragged."""
@@ -2353,26 +2385,17 @@ def _run_tkinter_floating_dot():
                 canvas.create_text(x+dx, y+dy, text=text, fill="#000000", font=f, tags=(tag,))
             canvas.create_text(x, y, text=text, fill="#e8e8e8", font=f, tags=(tag,))
 
-        phase = anim_phase[0]
         if not exp:
-            # --- Collapsed: single see-through glass dot ---
-            _draw_glass_circle(cx, cy, orb_r, "hub_main", bright=True, phase=phase)
-            canvas.create_oval(
-                cx - orb_r - 10, cy - orb_r - 10, cx + orb_r + 10, cy + orb_r + 10,
-                fill="", outline="#4888b8", width=2, dash=(3, 5), tags=("hub_main",))
-            canvas.tag_bind("hub_main", "<ButtonRelease-1>", _click_if_not_drag(do_expand))
-            canvas.tag_bind("hub_main", "<Button-3>", lambda e: _cleanup_and_quit())
+            _draw_glass_circle(cx, cy, orb_r, "hub_main", bright=True)
             return
 
-        # --- Expanded: center orb + 5 radial glass dots ---
-        ring_r = 160
-        sub_r = 38
+        # --- Expanded: center orb + 3 radial glass dots ---
+        ring_r = 155
+        sub_r = 78
         items = [
             ("Settings", "settings"),
             ("Task", "task"),
             ("Mic", "mic"),
-            ("Screen", "screen"),
-            ("History", "history"),
         ]
 
         for idx, (label, key) in enumerate(items):
@@ -2380,22 +2403,14 @@ def _run_tkinter_floating_dot():
             sx = int(cx + ring_r * math.cos(angle))
             sy = int(cy + ring_r * math.sin(angle))
             tag = f"sub_{key}"
-            _draw_glass_circle(sx, sy, sub_r, tag, phase=phase)
-            _outlined_text(sx, sy, label, 9, tag)
-            canvas.tag_bind(tag, "<ButtonRelease-1>", _click_if_not_drag(lambda k=key: on_choice(k)))
-
-        canvas.create_oval(
-            cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r,
-            fill="", outline="#385878", width=2, dash=(2, 5))
+            _draw_glass_circle(sx, sy, sub_r, tag)
+            _outlined_text(sx, sy, label, 12, tag)
 
         # Center orb (on top)
-        _draw_glass_circle(cx, cy, orb_r, "hub_main", bright=True, phase=phase)
-        canvas.tag_bind("hub_main", "<ButtonRelease-1>", _click_if_not_drag(do_collapse))
-        canvas.tag_bind("hub_main", "<Button-3>", lambda e: _cleanup_and_quit())
+        _draw_glass_circle(cx, cy, orb_r, "hub_main", bright=True)
 
     def do_expand():
         expanded[0] = True
-        # Grow from current position, keeping center in same spot
         old_size = DOT_SIZE
         new_size = EXPANDED_SIZE
         cx = root.winfo_x() + old_size // 2
@@ -2403,13 +2418,13 @@ def _run_tkinter_floating_dot():
         nx = max(0, min(cx - new_size // 2, sw - new_size))
         ny = max(0, min(cy - new_size // 2, sh - new_size))
         root.geometry(f"{new_size}x{new_size}+{nx}+{ny}")
+        root.update_idletasks()
         redraw()
         _start_rgb()
 
     def do_collapse():
         expanded[0] = False
         _stop_rgb()
-        # Shrink back, keeping center in same spot
         old_size = EXPANDED_SIZE
         new_size = DOT_SIZE
         cx = root.winfo_x() + old_size // 2
@@ -2417,13 +2432,14 @@ def _run_tkinter_floating_dot():
         nx = max(0, min(cx - new_size // 2, sw - new_size))
         ny = max(0, min(cy - new_size // 2, sh - new_size))
         root.geometry(f"{new_size}x{new_size}+{nx}+{ny}")
+        root.update_idletasks()
         redraw()
 
     def on_choice(key):
         do_collapse()
         if key == "settings":
             _open_settings_window(root)
-        elif key in ("task", "screen", "history"):
+        elif key == "task":
             _open_task_window(root)
         elif key == "mic":
             if voice_thread[0] and voice_thread[0].is_alive():
@@ -2436,11 +2452,51 @@ def _run_tkinter_floating_dot():
                     daemon=True)
                 voice_thread[0].start()
 
+    def _on_canvas_release(e):
+        """Handle all clicks by position -- works even when items are redrawn mid-click."""
+        if drag["dragging"]:
+            return
+        size = EXPANDED_SIZE if expanded[0] else DOT_SIZE
+        cx, cy = size // 2, size // 2
+        orb_r = 52
+
+        # Center dot
+        dist_sq = (e.x - cx) ** 2 + (e.y - cy) ** 2
+        if dist_sq <= (orb_r + 20) ** 2:
+            if expanded[0]:
+                do_collapse()
+            else:
+                do_expand()
+            return
+
+        # Sub-dots (only when expanded)
+        if expanded[0]:
+            ring_r = 155
+            sub_r = 78
+            items = [
+                ("Settings", "settings"),
+                ("Task", "task"),
+                ("Mic", "mic"),
+            ]
+            for idx, (label, key) in enumerate(items):
+                angle = (2 * math.pi * idx / len(items)) - math.pi / 2
+                sx = cx + ring_r * math.cos(angle)
+                sy = cy + ring_r * math.sin(angle)
+                d = (e.x - sx) ** 2 + (e.y - sy) ** 2
+                if d <= (sub_r + 15) ** 2:
+                    on_choice(key)
+                    return
+
+    def _on_canvas_rclick(e):
+        _cleanup_and_quit()
+
+    canvas.bind("<ButtonRelease-1>", _on_canvas_release)
+    canvas.bind("<Button-3>", _on_canvas_rclick)
+
     root.bind("<Escape>", _cleanup_and_quit)
 
     _position(DOT_SIZE)
     redraw()
-    dot_anim_job[0] = root.after(ANIM_MS, _anim_tick)
     root.mainloop()
 
 
