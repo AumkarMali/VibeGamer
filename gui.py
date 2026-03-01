@@ -18,6 +18,7 @@ import base64
 import io
 import json
 import re
+import math
 import pyautogui
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageTk
@@ -38,6 +39,14 @@ except ImportError:
     PynputController = PynputKey = None
     _PYNPUT_AVAILABLE = False
 
+# optional voice activation ("vibe gamer" hotword)
+try:
+    import speech_recognition as sr  # type: ignore[import]
+    _VOICE_AVAILABLE = True
+except ImportError:
+    sr = None
+    _VOICE_AVAILABLE = False
+
 # ── config (persisted API key) ──
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
@@ -54,15 +63,18 @@ def _load_config():
     return {}
 
 
-def _save_config(api_key: str, model: str, use_local: bool = True):
-    """Save API key, model, and use_local_model to config.json."""
+def _save_config(api_key: str, model: str, use_local: bool = True, **extra):
+    """Save API key, model, use_local_model, and any extra keys to config.json."""
+    cfg = _load_config()
+    cfg.update({
+        "claude_api_key": api_key,
+        "claude_model": model,
+        "use_local_model": use_local,
+    })
+    cfg.update(extra)
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump({
-                "claude_api_key": api_key,
-                "claude_model": model,
-                "use_local_model": use_local,
-            }, f, indent=2)
+            json.dump(cfg, f, indent=2)
     except OSError:
         pass
 
@@ -304,6 +316,7 @@ QWEN_MODELS = [
     "qwen2-vl-7b-instruct",
 ]
 DASHSCOPE_BASE = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"  # Singapore; or dashscope-us.aliyuncs.com for US
+OLLAMA_BASE = "https://app.ollama.com"  # use app.ollama, not bare ollama
 
 
 def _call_qwen(api_key: str, model: str, system: str, user_content: list, messages: list = None, max_tokens: int = 4096) -> str:
@@ -335,13 +348,15 @@ def _call_qwen(api_key: str, model: str, system: str, user_content: list, messag
 
 
 class AgentGUI:
-    """Single-window AI agent with chess and screen-control modes."""
+    """Single-window AI agent with chess and screen-control modes. When task_only=True, only task panel (no hub)."""
 
-    def __init__(self, root):
+    def __init__(self, root, task_only=False):
         self.root = root
-        root.title("AI Agent")
-        root.geometry("1400x900")
+        self.task_only = task_only
+        root.title("Vibe Gamer")
+        root.geometry("1100x800")
         root.configure(bg=BG)
+        root.minsize(320, 320)
 
         # ── settings variables (shared with popup) ──
         cfg = _load_config()
@@ -366,6 +381,11 @@ class AgentGUI:
         self._screen_action_count = 0
         self._hide_event = threading.Event()
         self._show_event = threading.Event()
+
+        # voice / hotword state
+        self.voice_enabled = False
+        self._voice_thread = None
+        self._voice_stop_event = threading.Event()
 
         # ── chess engine (headless) ──
         self.chess = ChessEngine(log_fn=self.log)
@@ -402,30 +422,47 @@ class AgentGUI:
     #  UI
     # ==================================================================
     def _build_ui(self):
-        outer = ttk.Frame(self.root, padding="10")
-        outer.grid(row=0, column=0, sticky="nsew")
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
+
+        # Task panel (old GUI: task / log / screen) — visible by default; hub overlay in corner
+        self.main_frame = ttk.Frame(self.root)
+        self.main_frame.grid(row=0, column=0, sticky="nsew")
+        self.main_frame.columnconfigure(0, weight=1)
+        self.main_frame.rowconfigure(0, weight=1)
+
+        outer = ttk.Frame(self.main_frame, padding="10")
+        outer.grid(row=0, column=0, sticky="nsew")
 
         # ── left panel ──
         left = ttk.Frame(outer)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
 
-        # title
+        # Back to hub (hidden when task_only; Kivy dot is the hub)
+        self.back_to_hub_btn = tk.Button(
+            left, text="← Back to hub", font=("Arial", 11),
+            bg="#444", fg="#fff", relief=tk.FLAT, padx=12, pady=6,
+            command=self._show_hub, cursor="hand2",
+        )
+        self.back_to_hub_btn.grid(row=0, column=0, pady=(0, 8))
+        if self.task_only:
+            self.back_to_hub_btn.grid_remove()
+
+        # title (old GUI)
         tk.Label(left, text="AI Agent", font=("Arial", 24, "bold"),
-                 bg=BG, fg=ACCENT).grid(row=0, column=0, pady=(0, 2))
+                 bg=BG, fg=ACCENT).grid(row=1, column=0, pady=(0, 2))
         tk.Label(left, text="Type a task and press Start",
                  font=("Arial", 10, "italic"),
-                 bg=BG, fg="#9e9e9e").grid(row=1, column=0, pady=(0, 8))
+                 bg=BG, fg="#9e9e9e").grid(row=2, column=0, pady=(0, 8))
 
         # status
         self.status_label = tk.Label(left, text="Loading...",
                                      font=("Arial", 12), bg=BG, fg="#FF9800")
-        self.status_label.grid(row=2, column=0, pady=(0, 10))
+        self.status_label.grid(row=3, column=0, pady=(0, 10))
 
         # task input
         task_frame = ttk.LabelFrame(left, text="Task", padding="6")
-        task_frame.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        task_frame.grid(row=4, column=0, sticky="ew", pady=(0, 8))
         self.task_text = tk.Text(
             task_frame, height=3, width=32, font=("Consolas", 10),
             bg=BG_DARK, fg="#d4d4d4", insertbackground="#fff",
@@ -436,7 +473,7 @@ class AgentGUI:
 
         # buttons row
         btn_row = tk.Frame(left, bg=BG)
-        btn_row.grid(row=4, column=0, pady=(0, 8))
+        btn_row.grid(row=5, column=0, pady=(0, 8))
 
         self.start_btn = tk.Button(
             btn_row, text="Start", font=("Arial", 14, "bold"),
@@ -457,11 +494,11 @@ class AgentGUI:
             bg="#444", fg="#fff", relief=tk.FLAT, padx=15, pady=5,
             command=lambda: self.log_text.delete("1.0", tk.END),
             cursor="hand2",
-        ).grid(row=5, column=0, pady=(0, 10))
+        ).grid(row=6, column=0, pady=(0, 10))
 
         # last action display
         act_frame = ttk.LabelFrame(left, text="Last Action", padding="8")
-        act_frame.grid(row=6, column=0, sticky="ew", pady=(0, 8))
+        act_frame.grid(row=7, column=0, sticky="ew", pady=(0, 8))
         self.action_label = tk.Label(
             act_frame, text="--", font=("Consolas", 24, "bold"),
             bg=BG, fg="#FFD700")
@@ -472,7 +509,7 @@ class AgentGUI:
 
         # stats
         stats_frame = ttk.LabelFrame(left, text="Stats", padding="8")
-        stats_frame.grid(row=7, column=0, sticky="ew")
+        stats_frame.grid(row=8, column=0, sticky="ew")
         self.stats_label = tk.Label(
             stats_frame,
             text="Mode: --\nCycles: 0\nActions: 0\nStatus: idle",
@@ -510,6 +547,253 @@ class AgentGUI:
                            ("dim", "#666666"), ("thought", "#80CBC4"),
                            ("result", "#FFD700")]:
             self.log_text.tag_config(tag, foreground=color)
+
+        # Glass-dot hub: only when not task_only (Kivy runs the dot as on-screen overlay)
+        if not self.task_only:
+            self._build_hub_ui(self.root)
+
+    def _build_hub_ui(self, parent):
+        self._hub_expanded = False
+        # Larger canvas so expanded radial menu (6 buttons) fits fully
+        size = 380
+        self.hub_canvas = tk.Canvas(parent, bg=BG, highlightthickness=0, bd=0)
+        self.hub_canvas.config(cursor="hand2")
+        self.hub_canvas.place(relx=1.0, rely=1.0, x=-12, y=-12, anchor="se", width=size, height=size)
+        self.hub_canvas.bind("<Configure>", self._redraw_hub)
+
+    def _show_hub(self):
+        """Switch to small hub-only window (glass dot, expand to 6 dots). No-op when task_only."""
+        if not hasattr(self, "hub_canvas"):
+            return
+        self.root.geometry("420x420")
+        self.main_frame.grid_remove()
+        self.hub_canvas.place_forget()
+        self.hub_canvas.grid(row=0, column=0, sticky="nsew")
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        self._redraw_hub()
+
+    def _show_task_panel(self):
+        """Show full task panel (old GUI) with hub overlay in corner. No-op when task_only."""
+        if not hasattr(self, "hub_canvas"):
+            return
+        self.root.geometry("1100x800")
+        self.hub_canvas.grid_remove()
+        self.main_frame.grid(row=0, column=0, sticky="nsew")
+        size = 380
+        self.hub_canvas.place(relx=1.0, rely=1.0, x=-12, y=-12, anchor="se", width=size, height=size)
+        if hasattr(self, "task_text"):
+            self.root.after(50, lambda: self.task_text.focus_set())
+
+    def _open_hub(self, expand=True):
+        """Show hub (small window with glass dot) and optionally expand radial menu."""
+        self._show_hub()
+        if expand:
+            self._hub_expanded = True
+            self._redraw_hub()
+
+    def _redraw_hub(self, event=None):
+        """Apple-style glass orb: frosted layers, then radial menu when expanded."""
+        if not hasattr(self, "hub_canvas"):
+            return
+        c = self.hub_canvas
+        c.delete("all")
+        w = c.winfo_width() or 1
+        h = c.winfo_height() or 1
+        cx, cy = w // 2, h // 2
+        expanded = getattr(self, "_hub_expanded", False)
+
+        # Apple-style glass colors: frosted dark with soft highlights
+        glass_dark = "#3c3c4a"
+        glass_mid = "#4a4a5c"
+        glass_highlight = "#6e6e82"
+        glass_edge = "#8a8a9e"
+        glass_inner_light = "#5c5c6e"
+        sub_glass = "#454555"
+        sub_edge = "#7a7a8e"
+        label_fg = "#e8e8ee"
+        hint_fg = "#9898a8"
+
+        # Smaller center orb; radius chosen so expanded ring fits in canvas
+        radius = min(28, int(min(w, h) * 0.10))
+        if radius < 18:
+            radius = 18
+
+        # —— Main glass orb (layered like Apple) ——
+        # 1) Outer soft edge
+        c.create_oval(
+            cx - radius - 2, cy - radius - 2, cx + radius + 2, cy + radius + 2,
+            fill="", outline=glass_edge, width=1, tags=("hub_main",)
+        )
+        # 2) Main fill
+        c.create_oval(
+            cx - radius, cy - radius, cx + radius, cy + radius,
+            fill=glass_dark, outline=glass_mid, width=1, tags=("hub_main",)
+        )
+        # 3) Inner “frost” layer
+        inner_r = max(radius - 8, 12)
+        c.create_oval(
+            cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r,
+            fill=glass_mid, outline="", width=0, tags=("hub_main",)
+        )
+        # 4) Top-left highlight (glass reflection)
+        spot_r = radius // 3
+        spot_cx = cx - radius // 3
+        spot_cy = cy - radius // 3
+        c.create_oval(
+            spot_cx - spot_r, spot_cy - spot_r, spot_cx + spot_r, spot_cy + spot_r,
+            fill=glass_inner_light, outline="", width=0, tags=("hub_main",)
+        )
+        # 5) Center label
+        c.create_text(
+            cx, cy, text="Vibe\nGamer",
+            fill=label_fg, font=("Segoe UI", 11, "bold"), tags=("hub_main",)
+        )
+        c.tag_bind("hub_main", "<Button-1>", lambda _e: self._toggle_hub_expansion())
+
+        if not expanded:
+            # Hint only when collapsed
+            c.create_text(
+                cx, cy + radius + 36,
+                text="Click to open",
+                fill=hint_fg, font=("Segoe UI", 9, "normal")
+            )
+            return
+
+        # —— Expanded: Apple-style radial menu ——
+        ring_r = radius * 2.4
+        sub_radius = int(radius * 0.48)
+        # Frosted “sheet” behind the ring (subtle circle)
+        c.create_oval(
+            cx - ring_r - sub_radius - 12, cy - ring_r - sub_radius - 12,
+            cx + ring_r + sub_radius + 12, cy + ring_r + sub_radius + 12,
+            fill=glass_dark, outline=glass_edge, width=1
+        )
+        # Ring line (optional, subtle)
+        c.create_oval(
+            cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r,
+            fill="", outline=glass_mid, width=1
+        )
+
+        items = [
+            ("Settings", "settings"),
+            ("Task", "task"),
+            ("Mic", "mic"),
+            ("Screen", "screen"),
+            ("History", "history"),
+        ]
+        for idx, (label, key) in enumerate(items):
+            angle = (2 * math.pi * idx / len(items)) - math.pi / 2
+            sx = cx + ring_r * math.cos(angle)
+            sy = cy + ring_r * math.sin(angle)
+            # Sub-dot: same glass treatment (fill + edge + small highlight)
+            c.create_oval(
+                sx - sub_radius - 1, sy - sub_radius - 1,
+                sx + sub_radius + 1, sy + sub_radius + 1,
+                fill="", outline=sub_edge, width=1, tags=(f"sub_{key}", "subdot"),
+            )
+            c.create_oval(
+                sx - sub_radius, sy - sub_radius,
+                sx + sub_radius, sy + sub_radius,
+                fill=sub_glass, outline=glass_highlight, width=1,
+                tags=(f"sub_{key}", "subdot"),
+            )
+            spot2_r = sub_radius // 2
+            c.create_oval(
+                sx - spot2_r, sy - spot2_r - 2, sx + spot2_r, sy - 2 + spot2_r,
+                fill=glass_inner_light, outline="", width=0, tags=(f"sub_{key}", "subdot"),
+            )
+            txt = c.create_text(
+                sx, sy + sub_radius + 14,
+                text=label, fill=label_fg, font=("Segoe UI", 9),
+                tags=(f"sub_{key}", "subdot"),
+            )
+            c.tag_bind(f"sub_{key}", "<Button-1>", lambda _e, k=key: self._handle_subdot_click(k))
+            c.tag_bind(txt, "<Button-1>", lambda _e, k=key: self._handle_subdot_click(k))
+
+        # Hint when expanded
+        c.create_text(
+            cx, cy + ring_r + sub_radius + 28,
+            text="Click center to close",
+            fill=hint_fg, font=("Segoe UI", 8, "normal")
+        )
+
+    def _toggle_hub_expansion(self):
+        self._hub_expanded = not getattr(self, "_hub_expanded", False)
+        self._redraw_hub()
+
+    def _handle_subdot_click(self, key: str):
+        """Handle clicks on radial dots: settings / task / mic / etc."""
+        if key == "settings":
+            self._open_settings()
+        elif key == "task":
+            self._show_task_panel()
+        elif key == "mic":
+            self._toggle_voice_activation()
+        elif key == "screen":
+            self._show_task_panel()
+            self.log("Screen control: enter a task; the agent will click/type as needed.", "info")
+        elif key == "history":
+            self._show_task_panel()
+            self.log("Prompt history is in prompt_history.json (learning from feedback).", "info")
+
+    def _toggle_voice_activation(self):
+        """Start/stop background hotword listening for \"vibe gamer\"."""
+        if not _VOICE_AVAILABLE or sr is None:
+            self.log(
+                "Voice activation requires 'speech_recognition' (and microphone drivers). "
+                "Install with: pip install SpeechRecognition pyaudio",
+                "warning",
+            )
+            return
+
+        self.voice_enabled = not self.voice_enabled
+        if self.voice_enabled:
+            self.log('Voice hotword listening enabled – say "vibe gamer" near your mic.', "info")
+            self._voice_stop_event.clear()
+            if self._voice_thread is None or not self._voice_thread.is_alive():
+                self._voice_thread = threading.Thread(target=self._voice_loop, daemon=True)
+                self._voice_thread.start()
+        else:
+            self.log("Voice hotword listening disabled.", "info")
+            self._voice_stop_event.set()
+
+    def _voice_loop(self):
+        """Background loop that listens for the phrase \"vibe gamer\"."""
+        if not _VOICE_AVAILABLE or sr is None:
+            return
+        recognizer = sr.Recognizer()
+        try:
+            with sr.Microphone() as source:
+                recognizer.adjust_for_ambient_noise(source, duration=0.8)
+        except Exception as e:
+            self.root.after(0, lambda: self.log(f"Voice mic error: {e}", "error"))
+            self.voice_enabled = False
+            return
+
+        while self.voice_enabled and not self._voice_stop_event.is_set():
+            try:
+                with sr.Microphone() as source:
+                    audio = recognizer.listen(source, timeout=5, phrase_time_limit=4)
+                try:
+                    text = recognizer.recognize_google(audio).lower()
+                except sr.UnknownValueError:
+                    continue
+                except sr.RequestError:
+                    # network or API issue; stay quiet instead of spamming errors
+                    continue
+
+                cleaned = text.replace(" ", "")
+                if "vibegamer" in cleaned or "vibe gamer" in text:
+                    self.root.after(0, lambda: self._open_hub(expand=True))
+                    self.root.after(0, lambda: self.log('Heard hotword "vibe gamer" – opening hub.', "info"))
+            except sr.WaitTimeoutError:
+                continue
+            except Exception as e:
+                self.root.after(0, lambda: self.log(f"Voice loop error: {e}", "error"))
+                break
+
+        self.voice_enabled = False
 
     # ==================================================================
     #  Settings Popup
@@ -1423,10 +1707,922 @@ I see the Run dialog. The user wanted to open Notepad. I already pressed Win+R. 
 
 
 # ======================================================================
-def main():
+# Kivy floating glass-dot (on-screen overlay, not in a normal window).
+# Install Kivy for the dot:  pip install kivy>=2.2.0
+# ======================================================================
+def _run_voice_listener(callback_on_hotword, stop_event):
+    """Run in a background thread; calls callback_on_hotword() when "vibe gamer" is heard. Stops when stop_event is set."""
+    if not _VOICE_AVAILABLE or sr is None:
+        return
+    recognizer = sr.Recognizer()
+    try:
+        with sr.Microphone() as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.8)
+    except Exception:
+        return
+    while not stop_event.is_set():
+        try:
+            with sr.Microphone() as source:
+                audio = recognizer.listen(source, timeout=5, phrase_time_limit=4)
+            try:
+                text = recognizer.recognize_google(audio).lower()
+            except (sr.UnknownValueError, sr.RequestError):
+                continue
+            cleaned = text.replace(" ", "")
+            if "vibegamer" in cleaned or "vibe gamer" in text:
+                callback_on_hotword()
+        except sr.WaitTimeoutError:
+            continue
+        except Exception:
+            break
+
+
+def _launch_task_panel():
+    """Launch the tkinter task panel in a new process."""
+    import subprocess
+    exe = sys.executable
+    script = os.path.abspath(__file__)
+    subprocess.Popen([exe, script, "--task"], cwd=os.path.dirname(script))
+
+
+def _open_settings_window(parent):
+    """Minimal, modern settings window launched from the floating dot."""
+    TRANS_S = "#030303"
+    WIN_W, WIN_H = 440, 520
+
+    win = tk.Toplevel(parent)
+    win.title("")
+    win.overrideredirect(1)
+    win.attributes("-topmost", True)
+    win.configure(bg=TRANS_S)
+    try:
+        win.attributes("-transparentcolor", TRANS_S)
+    except tk.TclError:
+        try:
+            win.attributes("-alpha", 0.96)
+        except tk.TclError:
+            pass
+
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    x = max(0, (sw - WIN_W) // 2)
+    y = max(0, (sh - WIN_H) // 2 - 60)
+    win.geometry(f"{WIN_W}x{WIN_H}+{x}+{y}")
+    win.resizable(False, False)
+
+    # Glass pill background
+    bg_c = tk.Canvas(win, bg=TRANS_S, highlightthickness=0, bd=0, width=WIN_W, height=WIN_H)
+    bg_c.pack(fill=tk.BOTH, expand=True)
+    pd, cr = 4, 24
+    for corner_x, corner_y in [(pd, pd), (WIN_W - pd - 2*cr, pd), (pd, WIN_H - pd - 2*cr), (WIN_W - pd - 2*cr, WIN_H - pd - 2*cr)]:
+        bg_c.create_oval(corner_x, corner_y, corner_x + 2*cr, corner_y + 2*cr, fill="#2e2e3e", outline="#505068", width=1)
+    bg_c.create_rectangle(pd + cr, pd, WIN_W - pd - cr, WIN_H - pd, fill="#2e2e3e", outline="")
+    bg_c.create_rectangle(pd, pd + cr, WIN_W - pd, WIN_H - pd - cr, fill="#2e2e3e", outline="")
+
+    cfg = _load_config()
+    api_key_var = tk.StringVar(value=(cfg.get("claude_api_key") or cfg.get("api_key") or "").strip() or os.environ.get("DASHSCOPE_API_KEY", ""))
+    model_var = tk.StringVar(value=cfg.get("claude_model") or cfg.get("model") or QWEN_MODELS[0])
+    use_local_var = tk.BooleanVar(value=cfg.get("use_local_model", True))
+    if model_var.get() not in QWEN_MODELS:
+        model_var.set(QWEN_MODELS[0])
+
+    y_pos = 24
+    # Title + close
+    tk.Label(win, text="Settings", font=("Segoe UI", 16, "bold"), bg="#2e2e3e", fg="#e0e0ee").place(x=28, y=y_pos)
+    tk.Button(win, text="X", font=("Segoe UI", 10, "bold"), bg="#2e2e3e", fg="#888", activebackground="#444", relief=tk.FLAT, bd=0, cursor="hand2", command=win.destroy).place(x=WIN_W - 38, y=y_pos + 2, width=24, height=24)
+    y_pos += 50
+
+    # Local model toggle
+    tk.Checkbutton(win, text="Use local model (free, no key)", variable=use_local_var, bg="#2e2e3e", fg="#c0c0d0", selectcolor="#1e1e2e", activebackground="#2e2e3e", activeforeground="#c0c0d0", font=("Segoe UI", 10)).place(x=28, y=y_pos)
+    y_pos += 40
+
+    # API key
+    tk.Label(win, text="API Key", font=("Segoe UI", 10), bg="#2e2e3e", fg="#9090a0").place(x=28, y=y_pos)
+    y_pos += 24
+    tk.Entry(win, textvariable=api_key_var, show="*", font=("Consolas", 11), bg="#1e1e2e", fg="#d0d0e0", insertbackground="#fff", relief=tk.FLAT, highlightthickness=1, highlightcolor="#606078", highlightbackground="#3a3a4c").place(x=28, y=y_pos, width=WIN_W - 56, height=34)
+    y_pos += 48
+
+    # Model
+    tk.Label(win, text="Model", font=("Segoe UI", 10), bg="#2e2e3e", fg="#9090a0").place(x=28, y=y_pos)
+    y_pos += 24
+    model_combo = ttk.Combobox(win, textvariable=model_var, values=QWEN_MODELS, state="readonly", width=36)
+    model_combo.place(x=28, y=y_pos, width=WIN_W - 56, height=32)
+    y_pos += 50
+
+    # ── Accessibility: Display Contrast ──
+    tk.Label(win, text="Accessibility", font=("Segoe UI", 12, "bold"), bg="#2e2e3e", fg="#e0e0ee").place(x=28, y=y_pos)
+    y_pos += 28
+    tk.Label(win, text="Display Contrast", font=("Segoe UI", 10), bg="#2e2e3e", fg="#9090a0").place(x=28, y=y_pos)
+
+    saved_contrast = cfg.get("display_contrast", 50)
+    contrast_var = tk.IntVar(value=saved_contrast)
+
+    contrast_val_lbl = tk.Label(win, text=f"{saved_contrast}%", font=("Segoe UI", 10, "bold"), bg="#2e2e3e", fg="#c0c0d0")
+    contrast_val_lbl.place(x=WIN_W - 70, y=y_pos)
+    y_pos += 26
+
+    preview_cv = tk.Canvas(win, bg="#2e2e3e", highlightthickness=0, bd=0, height=30)
+    preview_cv.place(x=28, y=y_pos + 34, width=WIN_W - 56, height=30)
+
+    def _update_contrast_preview(val=None):
+        v = contrast_var.get()
+        contrast_val_lbl.config(text=f"{v}%")
+        # Map 0-100 to a range of greys for preview: 0% = #000, 100% = #fff
+        lo = int(30 + (v / 100) * 80)
+        hi = int(80 + (v / 100) * 175)
+        bg_hex = f"#{lo:02x}{lo:02x}{lo:02x}"
+        fg_hex = f"#{hi:02x}{hi:02x}{hi:02x}"
+        preview_cv.delete("all")
+        preview_cv.create_rectangle(0, 0, (WIN_W - 56) // 2, 30, fill=bg_hex, outline="")
+        preview_cv.create_rectangle((WIN_W - 56) // 2, 0, WIN_W - 56, 30, fill=fg_hex, outline="")
+        preview_cv.create_text((WIN_W - 56) // 4, 15, text="Aa Dark", fill=fg_hex, font=("Segoe UI", 10))
+        preview_cv.create_text(3 * (WIN_W - 56) // 4, 15, text="Aa Light", fill=bg_hex, font=("Segoe UI", 10))
+
+    contrast_slider = tk.Scale(win, from_=0, to=100, orient=tk.HORIZONTAL, variable=contrast_var,
+                               bg="#2e2e3e", fg="#c0c0d0", troughcolor="#1e1e2e", highlightthickness=0,
+                               activebackground="#6a6a80", sliderrelief=tk.FLAT, bd=0, showvalue=False,
+                               command=_update_contrast_preview)
+    contrast_slider.place(x=28, y=y_pos, width=WIN_W - 56)
+    y_pos += 70
+
+    _update_contrast_preview()
+
+    # Save button
+    def _save_and_close():
+        _save_config(api_key_var.get().strip(), model_var.get(), use_local_var.get(),
+                     display_contrast=contrast_var.get())
+        win.destroy()
+
+    tk.Button(win, text="Save", font=("Segoe UI", 12, "bold"), bg="#4CAF50", fg="#fff", activebackground="#388E3C", relief=tk.FLAT, cursor="hand2", command=_save_and_close).place(x=28, y=y_pos, width=WIN_W - 56, height=40)
+
+    # Drag support
+    drag_data = {"x": 0, "y": 0}
+    def _start_drag(e):
+        drag_data["x"] = e.x
+        drag_data["y"] = e.y
+    def _do_drag(e):
+        nx = win.winfo_x() + e.x - drag_data["x"]
+        ny = win.winfo_y() + e.y - drag_data["y"]
+        win.geometry(f"+{nx}+{ny}")
+    bg_c.bind("<Button-1>", _start_drag)
+    bg_c.bind("<B1-Motion>", _do_drag)
+
+
+def _open_task_window(parent):
+    """Glass-style floating task bar: type a task, hit Go, see status. Hooks into agent backend."""
+    TRANS_TASK = "#020202"
+    BAR_W, BAR_H = 600, 200
+
+    win = tk.Toplevel(parent)
+    win.title("")
+    win.overrideredirect(1)
+    win.attributes("-topmost", True)
+    win.configure(bg=TRANS_TASK)
+    try:
+        win.attributes("-transparentcolor", TRANS_TASK)
+    except tk.TclError:
+        try:
+            win.attributes("-alpha", 0.95)
+        except tk.TclError:
+            pass
+
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    x = max(0, (sw - BAR_W) // 2)
+    y = max(0, (sh - BAR_H) // 2 - 100)
+    win.geometry(f"{BAR_W}x{BAR_H}+{x}+{y}")
+    win.resizable(False, False)
+
+    # Glass pill background
+    pill = tk.Canvas(win, bg=TRANS_TASK, highlightthickness=0, bd=0, width=BAR_W, height=BAR_H)
+    pill.pack(fill=tk.BOTH, expand=True)
+    # Rounded-rect pill (approximated with oval + rect)
+    pad = 6
+    pr = 30  # corner radius
+    pill.create_oval(pad, pad, pad + 2 * pr, pad + 2 * pr, fill="#3a3a4c", outline="#6a6a80", width=1)
+    pill.create_oval(BAR_W - pad - 2 * pr, pad, BAR_W - pad, pad + 2 * pr, fill="#3a3a4c", outline="#6a6a80", width=1)
+    pill.create_oval(pad, BAR_H - pad - 2 * pr, pad + 2 * pr, BAR_H - pad, fill="#3a3a4c", outline="#6a6a80", width=1)
+    pill.create_oval(BAR_W - pad - 2 * pr, BAR_H - pad - 2 * pr, BAR_W - pad, BAR_H - pad, fill="#3a3a4c", outline="#6a6a80", width=1)
+    pill.create_rectangle(pad + pr, pad, BAR_W - pad - pr, BAR_H - pad, fill="#3a3a4c", outline="")
+    pill.create_rectangle(pad, pad + pr, BAR_W - pad, BAR_H - pad - pr, fill="#3a3a4c", outline="")
+    # Top border line
+    pill.create_line(pad + pr, pad, BAR_W - pad - pr, pad, fill="#6a6a80")
+    # Bottom border line
+    pill.create_line(pad + pr, BAR_H - pad, BAR_W - pad - pr, BAR_H - pad, fill="#6a6a80")
+
+    # --- Widgets inside the pill ---
+    # Status label
+    status_var = tk.StringVar(value="Ready")
+    status_lbl = tk.Label(win, textvariable=status_var, font=("Segoe UI", 10), bg="#3a3a4c", fg="#aaaabc")
+    status_lbl.place(x=30, y=18, width=BAR_W - 60, height=22)
+
+    # Task text entry
+    task_entry = tk.Entry(
+        win, font=("Segoe UI", 14), bg="#2a2a3a", fg="#e8e8f0",
+        insertbackground="#fff", relief=tk.FLAT,
+        highlightthickness=1, highlightcolor="#8888a0", highlightbackground="#4a4a5c")
+    task_entry.place(x=30, y=48, width=BAR_W - 140, height=42)
+    task_entry.insert(0, "Type a task...")
+    task_entry.bind("<FocusIn>", lambda e: task_entry.delete(0, tk.END) if task_entry.get() == "Type a task..." else None)
+
+    # Go / Stop button
+    running = [False]
+    agent_ref = [None]
+
+    go_btn = tk.Button(
+        win, text="Go", font=("Segoe UI", 13, "bold"),
+        bg="#4CAF50", fg="#fff", activebackground="#388E3C",
+        relief=tk.FLAT, cursor="hand2", width=6)
+    go_btn.place(x=BAR_W - 100, y=48, width=60, height=42)
+
+    # Status line at bottom
+    action_var = tk.StringVar(value="")
+    action_lbl = tk.Label(win, textvariable=action_var, font=("Consolas", 10), bg="#3a3a4c", fg="#FFD700", anchor="w")
+    action_lbl.place(x=30, y=100, width=BAR_W - 60, height=22)
+
+    # Close button (X)
+    close_btn = tk.Button(
+        win, text="X", font=("Segoe UI", 10, "bold"),
+        bg="#3a3a4c", fg="#888", activebackground="#555",
+        relief=tk.FLAT, cursor="hand2", command=win.destroy, bd=0)
+    close_btn.place(x=BAR_W - 36, y=14, width=24, height=24)
+
+    # Hidden log + screenshot (invisible but needed by AgentGUI methods)
+    hidden_frame = tk.Frame(win, bg=TRANS_TASK)
+
+    class BarAgent(AgentGUI):
+        """Minimal agent that runs behind the glass task bar."""
+        def __init__(self):
+            self.root = hidden_frame
+            self.task_only = True
+
+            cfg = _load_config()
+            default_key = (cfg.get("claude_api_key") or cfg.get("api_key") or "").strip() or os.environ.get("DASHSCOPE_API_KEY", "")
+            default_model = cfg.get("claude_model") or cfg.get("model") or QWEN_MODELS[0]
+            if default_model not in QWEN_MODELS:
+                default_model = QWEN_MODELS[0]
+            self.claude_api_key_var = tk.StringVar(value=default_key)
+            self.claude_model_var = tk.StringVar(value=default_model)
+            self.use_local_var = tk.BooleanVar(value=cfg.get("use_local_model", True))
+            self.turn_var = tk.StringVar(value="white")
+            self.conf_var = tk.DoubleVar(value=0.30)
+            self.depth_var = tk.IntVar(value=18)
+            self.interval_var = tk.DoubleVar(value=3.0)
+            self.click_delay_var = tk.DoubleVar(value=0.15)
+
+            self._running = False
+            self._mode = None
+            self._thread = None
+            self._screen_action_count = 0
+            self._hide_event = threading.Event()
+            self._show_event = threading.Event()
+            self.voice_enabled = False
+            self._voice_thread = None
+            self._voice_stop_event = threading.Event()
+
+            self.chess = ChessEngine(log_fn=self.log)
+
+            # Invisible widgets that the inherited methods reference
+            self.main_frame = tk.Frame(hidden_frame)
+            self.task_text = tk.Text(hidden_frame, height=1, width=1)
+            self.start_btn = tk.Button(hidden_frame)
+            self.status_label = tk.Label(hidden_frame)
+            self.action_label = tk.Label(hidden_frame)
+            self.eval_label = tk.Label(hidden_frame)
+            self.stats_label = tk.Label(hidden_frame)
+            self.screenshot_label = tk.Label(hidden_frame)
+            self.log_text = scrolledtext.ScrolledText(hidden_frame, height=1, width=1)
+            for tag_name, color in [("info", "#4CAF50"), ("error", "#f44336"), ("action", "#2196F3"), ("warning", "#FF9800"), ("header", "#e94560"), ("piece", "#80CBC4"), ("move", "#FFD700"), ("board", "#B0BEC5"), ("dim", "#666666"), ("thought", "#80CBC4"), ("result", "#FFD700")]:
+                self.log_text.tag_config(tag_name, foreground=color)
+
+            threading.Thread(target=self._load_chess, daemon=True).start()
+            if self.use_local_var.get():
+                def _load_local_vl():
+                    try:
+                        from local_qwen_vl import load_model
+                        load_model()
+                    except Exception:
+                        pass
+                threading.Thread(target=_load_local_vl, daemon=True).start()
+
+        def log(self, msg, tag=""):
+            ts = time.strftime("%H:%M:%S")
+            # Show last log line in the status bar
+            short = msg.strip()[:80]
+            win.after(0, lambda: action_var.set(f"[{ts}] {short}"))
+
+        def _hide_and_signal(self):
+            win.withdraw()
+            win.update()
+            self._hide_event.set()
+
+        def _show_and_signal(self):
+            win.deiconify()
+            win.update()
+            self._show_event.set()
+
+        def _hide_for_screenshot(self):
+            self._hide_event.clear()
+            win.after(0, self._hide_and_signal)
+            self._hide_event.wait(timeout=2.0)
+
+        def _show_after_screenshot(self):
+            self._show_event.clear()
+            win.after(0, self._show_and_signal)
+            self._show_event.wait(timeout=2.0)
+
+    agent = BarAgent()
+    agent_ref[0] = agent
+
+    def _go_or_stop():
+        if running[0]:
+            running[0] = False
+            agent._running = False
+            go_btn.config(text="Go", bg="#4CAF50", activebackground="#388E3C")
+            status_var.set("Stopped")
+        else:
+            task = task_entry.get().strip()
+            if not task or task == "Type a task...":
+                status_var.set("Enter a task first")
+                return
+            running[0] = True
+            go_btn.config(text="Stop", bg="#e94560", activebackground="#c0384d")
+            status_var.set("Running...")
+            agent.task_text.delete("1.0", tk.END)
+            agent.task_text.insert("1.0", task)
+            agent._running = True
+            agent.start_btn.config(text="Stop")
+            threading.Thread(target=_run_agent_task, args=(task,), daemon=True).start()
+
+    def _run_agent_task(task):
+        try:
+            agent._start_with_claude(task)
+        except Exception as e:
+            win.after(0, lambda: action_var.set(f"Error: {e}"))
+        finally:
+            running[0] = False
+            agent._running = False
+            win.after(0, lambda: go_btn.config(text="Go", bg="#4CAF50", activebackground="#388E3C"))
+            win.after(0, lambda: status_var.set("Done"))
+
+    go_btn.config(command=_go_or_stop)
+    task_entry.bind("<Return>", lambda e: _go_or_stop())
+
+    # Drag support (since borderless)
+    drag_data = {"x": 0, "y": 0}
+    def _start_drag(e):
+        drag_data["x"] = e.x
+        drag_data["y"] = e.y
+    def _do_drag(e):
+        dx = e.x - drag_data["x"]
+        dy = e.y - drag_data["y"]
+        nx = win.winfo_x() + dx
+        ny = win.winfo_y() + dy
+        win.geometry(f"+{nx}+{ny}")
+    pill.bind("<Button-1>", _start_drag)
+    pill.bind("<B1-Motion>", _do_drag)
+
+    task_entry.focus_set()
+
+
+def _run_tkinter_floating_dot():
+    """Apple Intelligence-style floating glass dot. See-through, expands to 5 glass dots."""
+    TRANS = "#010101"
+    DOT_SIZE = 120
+    EXPANDED_SIZE = 480
+    RGB_THICKNESS = 3
+    RGB_SPEED_MS = 30
+
     root = tk.Tk()
-    AgentGUI(root)
+    root.title("")
+    root.overrideredirect(1)
+    root.attributes("-topmost", True)
+    root.configure(bg=TRANS)
+    try:
+        root.attributes("-transparentcolor", TRANS)
+    except tk.TclError:
+        try:
+            root.attributes("-alpha", 0.93)
+        except tk.TclError:
+            pass
+
+    root.update_idletasks()
+    sw = root.winfo_screenwidth()
+    sh = root.winfo_screenheight()
+
+    expanded = [False]
+    voice_stop = threading.Event()
+    voice_thread = [None]
+
+    # ── RGB screen-border glow overlay ──
+    import colorsys
+
+    rgb_win = tk.Toplevel(root)
+    rgb_win.title("")
+    rgb_win.overrideredirect(1)
+    rgb_win.attributes("-topmost", True)
+    rgb_win.geometry(f"{sw}x{sh}+0+0")
+    rgb_trans = "#020202"
+    rgb_win.configure(bg=rgb_trans)
+    try:
+        rgb_win.attributes("-transparentcolor", rgb_trans)
+    except tk.TclError:
+        try:
+            rgb_win.attributes("-alpha", 0.85)
+        except tk.TclError:
+            pass
+    rgb_cv = tk.Canvas(rgb_win, bg=rgb_trans, highlightthickness=0, bd=0,
+                       width=sw, height=sh)
+    rgb_cv.pack(fill=tk.BOTH, expand=True)
+    rgb_cv.config(cursor="arrow")
+    rgb_win.attributes("-disabled", True)
+    rgb_win.withdraw()
+
+    rgb_hue = [0.0]
+    rgb_active = [False]
+    rgb_fading = [None]        # "in" | "out" | None
+    rgb_opacity = [0.0]        # 0.0 to 1.0 (controls brightness during fade)
+    rgb_job = [None]
+    RGB_FADE_STEP = 0.045      # opacity change per tick (~22 ticks = ~0.7s fade)
+    RGB_GLOW_LAYERS = 4        # layered lines for soft glow edge
+
+    def _hsv_to_hex(h, s=1.0, v=1.0):
+        r, g, b = colorsys.hsv_to_rgb(h % 1.0, s, v)
+        return f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
+
+    def _blend(hex_color, opacity):
+        """Dim a hex color toward black by opacity (0=invisible, 1=full)."""
+        r = int(hex_color[1:3], 16)
+        g = int(hex_color[3:5], 16)
+        b = int(hex_color[5:7], 16)
+        r = int(r * opacity)
+        g = int(g * opacity)
+        b = int(b * opacity)
+        return f"#{max(r,3):02x}{max(g,3):02x}{max(b,3):02x}"
+
+    def _draw_rgb_border():
+        rgb_cv.delete("all")
+        op = rgb_opacity[0]
+        if op <= 0.01:
+            return
+        base_t = RGB_THICKNESS
+        segments = 80
+        seg_w = sw / segments
+        seg_h = sh / segments
+
+        for layer in range(RGB_GLOW_LAYERS, 0, -1):
+            t = base_t + (layer - 1) * 2
+            layer_op = op * (0.3 if layer > 1 else 1.0) * (1.0 / layer)
+            offset_y = (layer - 1) * 2
+
+            for i in range(segments):
+                hue_top = (rgb_hue[0] + i / segments) % 1.0
+                hue_bot = (rgb_hue[0] + 0.5 + i / segments) % 1.0
+                c_top = _blend(_hsv_to_hex(hue_top, 0.85, 1.0), layer_op)
+                c_bot = _blend(_hsv_to_hex(hue_bot, 0.85, 1.0), layer_op)
+                x1, x2 = int(i * seg_w), int((i + 1) * seg_w)
+                rgb_cv.create_rectangle(x1, offset_y, x2, offset_y + t, fill=c_top, outline="")
+                rgb_cv.create_rectangle(x1, sh - offset_y - t, x2, sh - offset_y, fill=c_bot, outline="")
+
+            for i in range(segments):
+                hue_left = (rgb_hue[0] + 0.75 + i / segments) % 1.0
+                hue_right = (rgb_hue[0] + 0.25 + i / segments) % 1.0
+                c_left = _blend(_hsv_to_hex(hue_left, 0.85, 1.0), layer_op)
+                c_right = _blend(_hsv_to_hex(hue_right, 0.85, 1.0), layer_op)
+                y1, y2 = int(i * seg_h), int((i + 1) * seg_h)
+                rgb_cv.create_rectangle(offset_y, y1, offset_y + t, y2, fill=c_left, outline="")
+                rgb_cv.create_rectangle(sw - offset_y - t, y1, sw - offset_y, y2, fill=c_right, outline="")
+
+    def _rgb_tick():
+        if not rgb_active[0] and rgb_fading[0] != "out":
+            return
+
+        # Handle fade transitions
+        if rgb_fading[0] == "in":
+            rgb_opacity[0] = min(1.0, rgb_opacity[0] + RGB_FADE_STEP)
+            if rgb_opacity[0] >= 1.0:
+                rgb_fading[0] = None
+        elif rgb_fading[0] == "out":
+            rgb_opacity[0] = max(0.0, rgb_opacity[0] - RGB_FADE_STEP)
+            if rgb_opacity[0] <= 0.0:
+                rgb_fading[0] = None
+                rgb_cv.delete("all")
+                rgb_win.withdraw()
+                return
+
+        rgb_hue[0] = (rgb_hue[0] + 0.005) % 1.0
+        _draw_rgb_border()
+        rgb_job[0] = root.after(RGB_SPEED_MS, _rgb_tick)
+
+    def _start_rgb():
+        if rgb_active[0] and rgb_fading[0] != "out":
+            return
+        rgb_active[0] = True
+        rgb_fading[0] = "in"
+        rgb_opacity[0] = 0.0
+        rgb_win.deiconify()
+        rgb_win.lift()
+        root.lift()
+        if rgb_job[0]:
+            root.after_cancel(rgb_job[0])
+        _rgb_tick()
+
+    def _stop_rgb():
+        rgb_active[0] = False
+        if rgb_fading[0] == "out":
+            return
+        rgb_fading[0] = "out"
+        if not rgb_job[0]:
+            _rgb_tick()
+
+    canvas = tk.Canvas(root, bg=TRANS, highlightthickness=0, bd=0)
+    canvas.pack(fill=tk.BOTH, expand=True)
+    canvas.config(cursor="hand2")
+
+    # ── Drag support ──
+    drag = {"x": 0, "y": 0, "dragging": False}
+
+    def _drag_start(e):
+        drag["x"] = e.x
+        drag["y"] = e.y
+        drag["dragging"] = False
+
+    def _drag_motion(e):
+        dx = abs(e.x - drag["x"])
+        dy = abs(e.y - drag["y"])
+        if dx > 4 or dy > 4:
+            drag["dragging"] = True
+        if drag["dragging"]:
+            nx = root.winfo_x() + (e.x - drag["x"])
+            ny = root.winfo_y() + (e.y - drag["y"])
+            root.geometry(f"+{nx}+{ny}")
+            drag["x"] = e.x
+            drag["y"] = e.y
+
+    canvas.bind("<Button-1>", _drag_start)
+    canvas.bind("<B1-Motion>", _drag_motion)
+
+    def _position(size, center=True):
+        if center:
+            x = max(0, (sw - size) // 2)
+            y = max(0, (sh - size) // 2)
+            root.geometry(f"{size}x{size}+{x}+{y}")
+        else:
+            root.geometry(f"{size}x{size}")
+
+    def _anim_tick():
+        anim_phase[0] = (anim_phase[0] + 0.018) % 1.0
+        redraw()
+        try:
+            dot_anim_job[0] = root.after(ANIM_MS, _anim_tick)
+        except tk.TclError:
+            pass
+
+    def _cleanup_and_quit(e=None):
+        rgb_active[0] = False
+        rgb_fading[0] = None
+        if rgb_job[0]:
+            root.after_cancel(rgb_job[0])
+            rgb_job[0] = None
+        if dot_anim_job[0]:
+            try:
+                root.after_cancel(dot_anim_job[0])
+            except tk.TclError:
+                pass
+            dot_anim_job[0] = None
+        root.destroy()
+
+    anim_phase = [0.0]
+    dot_anim_job = [None]
+    ANIM_MS = 42
+
+    def _lerp_hex(c1, c2, t):
+        """Blend two hex colors; t in [0,1]."""
+        r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
+        r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
+        r = int(r1 + (r2 - r1) * t)
+        g = int(g1 + (g2 - g1) * t)
+        b = int(b1 + (b2 - b1) * t)
+        return f"#{max(0,min(255,r)):02x}{max(0,min(255,g)):02x}{max(0,min(255,b)):02x}"
+
+    def _draw_glass_circle(cx, cy, r, tag, bright=False, phase=0.0):
+        """Translucent glass dot -- concentric rings, slightly thicker; breathes with phase."""
+        # Breathing scale: bigger then smaller (phase 0→1 = one full cycle)
+        breath = 1.0 + 0.08 * math.sin(phase * 2 * math.pi)
+        r0 = r * breath
+        r1 = (r - 3) * breath
+        r2 = (r - 6) * breath
+        r3 = (r - 9) * breath
+        ir = max((r - 13) * breath, 3)
+
+        # Color integration: blend toward white at peak (phase 0.5)
+        t = 0.3 + 0.4 * math.sin(phase * 2 * math.pi)  # 0.3 to 0.7
+        blue_outer = _lerp_hex("#4888b8", "#a0c8f0", t) if not bright else _lerp_hex("#6ab0e6", "#c8e0ff", t)
+        white_ring = _lerp_hex("#b0b8c4", "#f0f4ff", t) if not bright else _lerp_hex("#e0e8f0", "#ffffff", t)
+        blue_inner = _lerp_hex("#385878", "#6090b8", t) if not bright else _lerp_hex("#5090c0", "#80b8e8", t)
+
+        # Outermost -- black ring (thicker)
+        canvas.create_oval(cx - r0, cy - r0, cx + r0, cy + r0, fill="", outline="#1a1a1a", width=3, tags=(tag,))
+        # Light blue glow ring (thicker)
+        canvas.create_oval(cx - r1, cy - r1, cx + r1, cy + r1, fill="", outline=blue_outer, width=3, tags=(tag,))
+        # White ring (thicker)
+        canvas.create_oval(cx - r2, cy - r2, cx + r2, cy + r2, fill="", outline=white_ring, width=2, tags=(tag,))
+        # Inner black ring (thicker)
+        canvas.create_oval(cx - r3, cy - r3, cx + r3, cy + r3, fill="", outline="#2a2a2a" if not bright else "#3a3a3a", width=2, tags=(tag,))
+        # Center fill (visible, clickable) + innermost ring
+        canvas.create_oval(cx - ir, cy - ir, cx + ir, cy + ir, fill="#c8d4e4" if bright else "#586880", outline=blue_inner, width=2, dash=(2, 3), tags=(tag,))
+
+    def redraw():
+        canvas.delete("all")
+        exp = expanded[0]
+        size = EXPANDED_SIZE if exp else DOT_SIZE
+        cx, cy = size // 2, size // 2
+        orb_r = 38
+
+        def _click_if_not_drag(callback):
+            """Only fire callback if the user clicked, not dragged."""
+            def handler(e):
+                if not drag["dragging"]:
+                    callback()
+            return handler
+
+        def _outlined_text(x, y, text, size, tag):
+            """Text with dark outline so it reads on any background."""
+            f = ("Segoe UI", size, "bold")
+            for dx, dy in [(-1,-1),(1,-1),(-1,1),(1,1)]:
+                canvas.create_text(x+dx, y+dy, text=text, fill="#000000", font=f, tags=(tag,))
+            canvas.create_text(x, y, text=text, fill="#e8e8e8", font=f, tags=(tag,))
+
+        phase = anim_phase[0]
+        if not exp:
+            # --- Collapsed: single see-through glass dot ---
+            _draw_glass_circle(cx, cy, orb_r, "hub_main", bright=True, phase=phase)
+            canvas.create_oval(
+                cx - orb_r - 10, cy - orb_r - 10, cx + orb_r + 10, cy + orb_r + 10,
+                fill="", outline="#4888b8", width=2, dash=(3, 5), tags=("hub_main",))
+            canvas.tag_bind("hub_main", "<ButtonRelease-1>", _click_if_not_drag(do_expand))
+            canvas.tag_bind("hub_main", "<Button-3>", lambda e: _cleanup_and_quit())
+            return
+
+        # --- Expanded: center orb + 5 radial glass dots ---
+        ring_r = 160
+        sub_r = 38
+        items = [
+            ("Settings", "settings"),
+            ("Task", "task"),
+            ("Mic", "mic"),
+            ("Screen", "screen"),
+            ("History", "history"),
+        ]
+
+        for idx, (label, key) in enumerate(items):
+            angle = (2 * math.pi * idx / len(items)) - math.pi / 2
+            sx = int(cx + ring_r * math.cos(angle))
+            sy = int(cy + ring_r * math.sin(angle))
+            tag = f"sub_{key}"
+            _draw_glass_circle(sx, sy, sub_r, tag, phase=phase)
+            _outlined_text(sx, sy, label, 9, tag)
+            canvas.tag_bind(tag, "<ButtonRelease-1>", _click_if_not_drag(lambda k=key: on_choice(k)))
+
+        canvas.create_oval(
+            cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r,
+            fill="", outline="#385878", width=2, dash=(2, 5))
+
+        # Center orb (on top)
+        _draw_glass_circle(cx, cy, orb_r, "hub_main", bright=True, phase=phase)
+        canvas.tag_bind("hub_main", "<ButtonRelease-1>", _click_if_not_drag(do_collapse))
+        canvas.tag_bind("hub_main", "<Button-3>", lambda e: _cleanup_and_quit())
+
+    def do_expand():
+        expanded[0] = True
+        # Grow from current position, keeping center in same spot
+        old_size = DOT_SIZE
+        new_size = EXPANDED_SIZE
+        cx = root.winfo_x() + old_size // 2
+        cy = root.winfo_y() + old_size // 2
+        nx = max(0, min(cx - new_size // 2, sw - new_size))
+        ny = max(0, min(cy - new_size // 2, sh - new_size))
+        root.geometry(f"{new_size}x{new_size}+{nx}+{ny}")
+        redraw()
+        _start_rgb()
+
+    def do_collapse():
+        expanded[0] = False
+        _stop_rgb()
+        # Shrink back, keeping center in same spot
+        old_size = EXPANDED_SIZE
+        new_size = DOT_SIZE
+        cx = root.winfo_x() + old_size // 2
+        cy = root.winfo_y() + old_size // 2
+        nx = max(0, min(cx - new_size // 2, sw - new_size))
+        ny = max(0, min(cy - new_size // 2, sh - new_size))
+        root.geometry(f"{new_size}x{new_size}+{nx}+{ny}")
+        redraw()
+
+    def on_choice(key):
+        do_collapse()
+        if key == "settings":
+            _open_settings_window(root)
+        elif key in ("task", "screen", "history"):
+            _open_task_window(root)
+        elif key == "mic":
+            if voice_thread[0] and voice_thread[0].is_alive():
+                voice_stop.set()
+            else:
+                voice_stop.clear()
+                voice_thread[0] = threading.Thread(
+                    target=_run_voice_listener,
+                    args=(lambda: root.after(0, do_expand), voice_stop),
+                    daemon=True)
+                voice_thread[0].start()
+
+    root.bind("<Escape>", _cleanup_and_quit)
+
+    _position(DOT_SIZE)
+    redraw()
+    dot_anim_job[0] = root.after(ANIM_MS, _anim_tick)
     root.mainloop()
+
+
+# Kivy glass-dot app (borderless, always-on-top, on-screen overlay)
+def _run_kivy_dot_app():
+    # Set before any Window is created (required for borderless / position)
+    try:
+        from kivy.config import Config
+        Config.set("graphics", "borderless", "1")
+        Config.set("graphics", "width", "420")
+        Config.set("graphics", "height", "420")
+    except Exception:
+        pass
+    from kivy.app import App
+    from kivy.core.window import Window
+    from kivy.uix.widget import Widget
+    from kivy.uix.floatlayout import FloatLayout
+    from kivy.uix.label import Label
+    from kivy.graphics import Color, Ellipse
+    from kivy.clock import Clock
+    from kivy.uix.button import Button
+
+    class GlassDotWidget(Widget):
+        def __init__(self, on_choice, **kwargs):
+            super().__init__(**kwargs)
+            self.expanded = False
+            self.on_choice = on_choice
+            self.radius = 28
+            self._voice_stop = threading.Event()
+            self._voice_thread = None
+            self.voice_enabled = False
+            self.bind(size=self._redraw, pos=self._redraw)
+            # Always-visible center label so the dot is easy to spot
+            self._label = Label(
+                text="Vibe\nGamer",
+                font_size="14sp",
+                bold=True,
+                color=(0.95, 0.95, 0.98, 1),
+                halign="center",
+                valign="middle",
+                size_hint=(None, None),
+                size=(120, 60),
+                text_size=(120, 60),
+            )
+            self.add_widget(self._label)
+
+        def _redraw(self, *args):
+            self.canvas.clear()
+            w, h = self.size
+            if w <= 0 or h <= 0:
+                return
+            cx, cy = w / 2, h / 2
+            r = self.radius
+            glass_dark = (0.235, 0.235, 0.29, 1)
+            glass_mid = (0.29, 0.29, 0.36, 1)
+            glass_hl = (0.43, 0.43, 0.51, 1)
+            glass_edge = (0.54, 0.54, 0.62, 1)
+            with self.canvas:
+                # Expanded: frosted sheet and ring first (behind orb)
+                if self.expanded:
+                    ring_r = r * 2.4
+                    Color(*glass_dark)
+                    Ellipse(pos=(cx - ring_r - r - 12, cy - ring_r - r - 12),
+                            size=(2 * (ring_r + r + 12), 2 * (ring_r + r + 12)))
+                    Color(*glass_mid)
+                    Ellipse(pos=(cx - ring_r, cy - ring_r), size=(2 * ring_r, 2 * ring_r))
+                # Center orb (on top)
+                Color(*glass_edge)
+                Ellipse(pos=(cx - r - 2, cy - r - 2), size=(2 * (r + 2), 2 * (r + 2)))
+                Color(*glass_dark)
+                Ellipse(pos=(cx - r, cy - r), size=(2 * r, 2 * r))
+                Color(*glass_mid)
+                Ellipse(pos=(cx - r + 8, cy - r + 8), size=(2 * (r - 8), 2 * (r - 8)))
+                Color(*glass_hl)
+                Ellipse(pos=(cx - r / 3 - r / 3, cy - r / 3 - r / 3), size=(2 * r / 3, 2 * r / 3))
+            # Keep label centered on orb
+            self._label.pos = (cx - 60, cy - 30)
+            self._label.text = "Vibe\nGamer" if not self.expanded else "Click to close"
+
+        def _clear_children(self):
+            for c in list(self.children):
+                self.remove_widget(c)
+
+        def _build_buttons(self):
+            self._clear_children()
+            if not self.expanded:
+                return
+            w, h = self.size
+            cx, cy = w / 2, h / 2
+            ring_r = self.radius * 2.4
+            items = [
+                ("Settings", "settings"), ("Task", "task"), ("Mic", "mic"),
+                ("Screen", "screen"), ("History", "history"),
+            ]
+            for idx, (label, key) in enumerate(items):
+                angle = (2 * math.pi * idx / len(items)) - math.pi / 2
+                sx = cx + ring_r * math.cos(angle)
+                sy = cy + ring_r * math.sin(angle)
+                btn = Button(
+                    text=label, size_hint=(None, None), size=(80, 36),
+                    pos=(sx - 40, sy - 18), background_color=(0.27, 0.27, 0.33, 0.95),
+                    color=(0.9, 0.9, 0.93, 1),
+                )
+                btn.key = key
+                btn.bind(on_press=lambda b, k=key: self._on_sub(b, k))
+                self.add_widget(btn)
+
+        def _on_sub(self, btn, key):
+            self.on_choice(key)
+
+        def on_touch_down(self, touch):
+            if not self.collide_point(*touch.pos):
+                return False
+            w, h = self.size
+            cx, cy = w / 2, h / 2
+            dx, dy = touch.pos[0] - cx, touch.pos[1] - cy
+            dist = math.sqrt(dx * dx + dy * dy)
+            if dist <= self.radius + 4:
+                self.expanded = not self.expanded
+                self._redraw()
+                self._build_buttons()
+                return True
+            return super().on_touch_down(touch)
+
+    class VibeGamerDotApp(App):
+        def build(self):
+            Window.borderless = True
+            Window.always_on_top = True
+            Window.size = (420, 420)
+            Window.clearcolor = (0.1, 0.1, 0.12, 1)  # match dark hub
+            Clock.schedule_once(self._position_window, 0.1)
+            root = FloatLayout(size=(420, 420))
+            self.dot = GlassDotWidget(size_hint=(1, 1), size=(420, 420), on_choice=self._on_choice)
+            root.add_widget(self.dot)
+            # Redraw after layout so size is correct
+            Clock.schedule_once(lambda dt: self.dot._redraw(), 0.05)
+            return root
+
+        def _position_window(self, dt):
+            # Place floating dot where it's always visible: center of primary screen
+            try:
+                sw, sh = pyautogui.size()
+                # Center of screen so you can't miss it (then move to corner if you prefer)
+                win_w, win_h = 420, 420
+                Window.left = max(0, (sw - win_w) // 2)
+                Window.top = max(0, (sh - win_h) // 2)
+                # Bring to front so it's not behind other windows
+                if hasattr(Window, "raise_window"):
+                    Window.raise_window()
+            except Exception:
+                Window.left = 100
+                Window.top = 100
+
+        def _on_choice(self, key):
+            if key == "task" or key == "settings" or key == "screen" or key == "history":
+                _launch_task_panel()
+            elif key == "mic":
+                self._toggle_voice()
+
+        def _toggle_voice(self):
+            self.dot.voice_enabled = not self.dot.voice_enabled
+            if self.dot.voice_enabled:
+                self.dot._voice_stop.clear()
+                self.dot._voice_thread = threading.Thread(
+                    target=_run_voice_listener,
+                    args=(lambda: Clock.schedule_once(self._expand_dot), self.dot._voice_stop),
+                    daemon=True,
+                )
+                self.dot._voice_thread.start()
+            else:
+                self.dot._voice_stop.set()
+
+        def _expand_dot(self, dt):
+            self.dot.expanded = True
+            self.dot._redraw()
+            self.dot._build_buttons()
+
+    VibeGamerDotApp().run()
+
+
+def main():
+    _run_tkinter_floating_dot()
 
 
 if __name__ == "__main__":
