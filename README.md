@@ -24,7 +24,17 @@ Unified GUI: type a task → screenshot is sent to **Claude** → Claude either 
 4. **Claude API key**  
    In the app: **Settings → Claude API Key**. Get a key from [Anthropic](https://console.anthropic.com/).
 
-## Run
+## Run the desktop app (Electron)
+
+```bash
+cd electron-gui
+npm install
+npm start
+```
+
+See `electron-gui/README.md` for details. The floating dot opens the task/settings panels; the Python agent runs when you start a task.
+
+## Run the Python GUI (legacy)
 
 ```bash
 python gui.py
